@@ -24,7 +24,8 @@ Co 30 s sterownik wysyła `POST /update` (kontrakt v2 eaCloud):
 
 Klucz urządzenia idzie w nagłówku `X-SCCLOUDAPIKEY`.
 
-Ustawienia: przytrzymaj **S2 przy starcie**, połącz się z siecią `S-4_Dali_WiFi` i wpisz w sekcji *eaCloud* adres
+Ustawienia: `EACLOUD_URL` i `EACLOUD_KEY` w `secrets.h` (wzór w `secrets.example.h`) – mają pierwszeństwo.
+Gdy są puste: przytrzymaj **S2 przy starcie**, połącz się z siecią `S-4_Dali_WiFi` i wpisz w sekcji *eaCloud* adres
 (np. `http://192.168.1.50:8198/update`) i klucz urządzenia z eaCloud. Pusty adres = wysyłka wyłączona.
 
 - Wysyłka czeka, gdy oczka świecą, trwa alarm, sieć serwisowa albo operacja na magistrali DALI; rowerzyści się nie gubią.

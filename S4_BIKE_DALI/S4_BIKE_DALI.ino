@@ -62,7 +62,7 @@
 // v1.16: wysyłka danych do eaCloud co 30 s (POST /update, kontrakt v2): field1 = liczba rowerzystów od poprzedniej
 //       wysyłki (wejścia czujników START1/START2), field2 = czas pracy od uruchomienia [s], measured_at (gdy jest czas
 //       z NTP) i message_id (powtórzenie po zerwanym połączeniu nie tworzy duplikatu). Adres serwera i klucz urządzenia
-//       w portalu Wi-Fi (S2 przy starcie); pusty adres = wysyłka wyłączona. Wysyłka czeka, gdy oczka świecą.
+//       w secrets.h (EACLOUD_URL, EACLOUD_KEY) albo w portalu Wi-Fi (S2 przy starcie); pusty adres = wysyłka wyłączona. Wysyłka czeka, gdy oczka świecą.
 // =========================================================================
 
 #define FW_VERSION "1.16"
@@ -83,7 +83,14 @@
 // ==========================================
 // KONFIGURACJA POCZTY (NADAWCA)
 // ==========================================
-#include "secrets.h"   // SENDER_EMAIL, SENDER_PASSWORD (plik poza repozytorium, wzór: secrets.example.h)
+#include "secrets.h"   // SENDER_EMAIL, SENDER_PASSWORD, EACLOUD_URL, EACLOUD_KEY (plik poza repozytorium, wzór: secrets.example.h)
+// v1.16: adres i klucz eaCloud z secrets.h mają pierwszeństwo przed portalem Wi-Fi; puste = z portalu (EEPROM)
+#ifndef EACLOUD_URL
+#define EACLOUD_URL ""
+#endif
+#ifndef EACLOUD_KEY
+#define EACLOUD_KEY ""
+#endif
 
 #define SMTP_HOST           "smtp.gmail.com"
 #define SMTP_PORT           587
@@ -624,6 +631,8 @@ void setup() {
   trybOffline = (EEPROM.read(ADDR_WIFI_MODE) == 1);
   recipientEmail = readEmailFromEEPROM(); NAZWA_LOKALIZACJI = readLocationFromEEPROM();
   chmuraUrl = czytajTekstEEPROM(ADDR_CHMURA_URL, CHMURA_URL_DL); chmuraKlucz = czytajTekstEEPROM(ADDR_CHMURA_KLUCZ, CHMURA_KLUCZ_DL);
+  if (strlen(EACLOUD_URL)) chmuraUrl = EACLOUD_URL;
+  if (strlen(EACLOUD_KEY)) chmuraKlucz = EACLOUD_KEY;
   if (chmuraUrl.length()) chmuraOpis = "czekam na pierwszą wysyłkę";
 
   u8g2.clearBuffer(); u8g2.setFontPosTop(); u8g2.setFont(u8g2_font_unifont_t_polish); 
@@ -697,6 +706,8 @@ void setup() {
         String newKey = custom_chmura_klucz.getValue(); newKey.trim();
         if (newUrl != chmuraUrl) { chmuraUrl = newUrl; zapiszTekstEEPROM(ADDR_CHMURA_URL, CHMURA_URL_DL, chmuraUrl); }
         if (newKey != chmuraKlucz) { chmuraKlucz = newKey; zapiszTekstEEPROM(ADDR_CHMURA_KLUCZ, CHMURA_KLUCZ_DL, chmuraKlucz); }
+        if (strlen(EACLOUD_URL)) chmuraUrl = EACLOUD_URL;
+        if (strlen(EACLOUD_KEY)) chmuraKlucz = EACLOUD_KEY;
         chmuraOpis = chmuraUrl.length() ? "czekam na pierwszą wysyłkę" : "wyłączona (brak adresu)";
 
         int wModeVal = String(custom_mode.getValue()).toInt();
