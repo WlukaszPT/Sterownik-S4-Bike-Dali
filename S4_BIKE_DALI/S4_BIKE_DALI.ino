@@ -59,9 +59,13 @@
 //       „S4”/„opraw S4”. Stan Wi-Fi z przyczyną (złe hasło, nie widzę sieci, odmowa) na ekranie, w dzienniku i na stronie.
 //       Kreator: szukanie miejsca o podwójnym numerze krok po kroku – miejsce miga, dopóki serwisant nie odpowie
 //       „Tak, mruga” / „Nie – następne” (wcześniej mruganie przechodziło samo co 1,5 s i nie dało się zdążyć).
+// v1.16: wysyłka danych do eaCloud co 30 s (POST /update, kontrakt v2): field1 = liczba rowerzystów od poprzedniej
+//       wysyłki (wejścia czujników START1/START2), field2 = czas pracy od uruchomienia [s], measured_at (gdy jest czas
+//       z NTP) i message_id (powtórzenie po zerwanym połączeniu nie tworzy duplikatu). Adres serwera i klucz urządzenia
+//       w portalu Wi-Fi (S2 przy starcie); pusty adres = wysyłka wyłączona. Wysyłka czeka, gdy oczka świecą.
 // =========================================================================
 
-#define FW_VERSION "1.15"
+#define FW_VERSION "1.16"
 
 #include <Arduino.h>
 #include <U8g2lib.h>
@@ -70,6 +74,7 @@
 #include <ESP8266WiFi.h>
 #include <WiFiManager.h> 
 #include <ESP8266WebServer.h> 
+#include <ESP8266HTTPClient.h>
 #include <DNSServer.h>
 #include <RTClib.h>
 #include <Dusk2Dawn.h>
@@ -104,6 +109,7 @@ unsigned long ostatniPomiarAstro = 0;
 bool aktywnySkanerAwarii = true; 
 bool trybOffline = false; 
 String wifiOpis = "";       // v1.15: stan Wi-Fi z przyczyną (dziennik, strona serwisowa)
+String chmuraOpis = "wyłączona (brak adresu)"; // v1.16: stan wysyłki do eaCloud (raport, dziennik, strona serwisowa)
 
 // v1.15: stan Wi-Fi na ekranie (najwyżej 16 znaków) – te same napisy co sterownik oświetlenia DALI
 const char* wifiKrotko(int st) {
@@ -165,6 +171,10 @@ const int ADDR_RZAD_P        = 211;
 const int ADDR_HASLO_ZNACZNIK = 212; // v1.7: 0xC7 = zapisane stałe hasło sieci serwisowej
 const int ADDR_HASLO         = 213;  // 8 cyfr
 const uint8_t HASLO_ZNACZNIK = 0xC7;
+const int ADDR_CHMURA_URL    = 256;  // v1.16: adres eaCloud, np. http://192.168.1.50:8198/update (96 znaków)
+const int ADDR_CHMURA_KLUCZ  = 352;  // v1.16: klucz urządzenia z eaCloud (64 znaki)
+const int CHMURA_URL_DL      = 96;
+const int CHMURA_KLUCZ_DL    = 64;
 const uint8_t MAPA_ZNACZNIK  = 0xB6;
 
 #define DALI_BROADCAST_DAPC 0xFE
@@ -336,6 +346,18 @@ void saveLocationToEEPROM(String loc) {
   EEPROM.commit();
 }
 
+// v1.16: tekst z EEPROM (0 albo 0xFF = koniec; czysty EEPROM = pusty tekst)
+String czytajTekstEEPROM(int adr, int dl) {
+  String t = "";
+  for (int i = 0; i < dl; ++i) { char c = char(EEPROM.read(adr + i)); if (c == 0 || c == (char)255) break; t += c; }
+  return t;
+}
+
+void zapiszTekstEEPROM(int adr, int dl, const String& t) {
+  for (int i = 0; i < dl; ++i) EEPROM.write(adr + i, i < (int)t.length() ? t[i] : 0);
+  EEPROM.commit();
+}
+
 void configModeCallback(WiFiManager *myWiFiManager) {
   u8g2.clearBuffer(); u8g2.setFontPosTop(); u8g2.setFont(u8g2_font_unifont_t_polish);
   u8g2.drawUTF8((128 - u8g2.getUTF8Width("Skonfiguruj WiFi")) / 2, 0, "Skonfiguruj WiFi");
@@ -430,6 +452,7 @@ bool wyslijRaportEmail() {
   tresc += "\n-----------------------------------\n";
   tresc += "Wersja oprogramowania: " NAZWA_PRODUKTU " v" FW_VERSION "\n";
   if (trybOffline) tresc += "Tryb pracy: OFFLINE\n";
+  tresc += "eaCloud: " + chmuraOpis + "\n";
 
   message.text.content = tresc.c_str(); message.text.transfer_encoding = "base64"; message.text.charSet = F("utf-8");
   message.priority = esp_mail_smtp_priority::esp_mail_smtp_priority_normal; 
@@ -450,6 +473,77 @@ bool wyslijRaportEmail() {
     u8g2.clearBuffer(); const char* errSerwera = "Błąd serwera!"; u8g2.drawUTF8((128 - u8g2.getUTF8Width(errSerwera)) / 2, 35, errSerwera); u8g2.sendBuffer();
   }
   delay(1500); u8g2.clearBuffer(); wymusOled = true; return pomyslnaWysylka;
+}
+
+// ==========================================
+// v1.16: WYSYŁKA DANYCH DO eaCloud (kontrakt v2: docs/INGEST-KONTRAKT.md w repozytorium eaCloud)
+// ==========================================
+// Co CHMURA_OKRES_MS jedna wiadomość: field1 = rowerzyści od poprzedniej przyjętej wiadomości, field2 = czas pracy [s].
+// Wiadomość bez odpowiedzi serwera jest ponawiana bez zmian (ten sam message_id, serwer nie zapisze jej dwa razy);
+// rowerzyści policzeni w tym czasie idą w następnej. Odpowiedź „0” (zły klucz albo dane) – bez ponawiania, wpis w dzienniku.
+const unsigned long CHMURA_OKRES_MS = 30000UL;
+const uint16_t CHMURA_LIMIT_MS = 1500;        // limit czasu połączenia i odpowiedzi (sterownik w tym czasie nie czyta czujników)
+const unsigned long CHMURA_MAX_PRZERWA_MS = 5UL * 60UL * 1000UL; // serwer nie odpowiada: przerwa rośnie 30 s, 60 s … do 5 min
+const unsigned long CZUJNIK_PRZERWA_MS = 500; // krótsza przerwa w sygnale czujnika = ten sam rowerzysta
+
+String chmuraUrl = "", chmuraKlucz = "";
+uint32_t rowerzysciDoWyslania = 0;   // policzeni, jeszcze nie w żadnej wiadomości
+uint32_t rowerzysciRazem = 0;        // od uruchomienia (strona serwisowa)
+uint32_t chmuraNr = 0;               // numer wiadomości w tym uruchomieniu
+bool chmuraCzeka = false;            // wiadomość wysłana bez odpowiedzi – ponowić
+uint32_t chmuraCzekaRowerzysci = 0; unsigned long chmuraCzekaCzasPracy = 0; time_t chmuraCzekaCzas = 0; String chmuraCzekaId = "";
+bool sterownikZajety();
+
+// Wejście czujnika (START1 lub START2): nowy rowerzysta po co najmniej CZUJNIK_PRZERWA_MS bez sygnału.
+void liczRowerzystow(bool czujnik) {
+  static bool byl = false; static unsigned long koniecSygnalu = 0;
+  if (czujnik && !byl && millis() - koniecSygnalu >= CZUJNIK_PRZERWA_MS) { rowerzysciDoWyslania++; rowerzysciRazem++; }
+  if (!czujnik && byl) koniecSygnalu = millis();
+  byl = czujnik;
+}
+
+void ustawOpisChmury(const String& t) {
+  if (t != chmuraOpis) { chmuraOpis = t; dziennik("eaCloud: " + t); }
+}
+
+void wyslijDoChmury() {
+  static unsigned long ostatnia = 0, przerwa = CHMURA_OKRES_MS;
+  if (chmuraUrl.length() == 0 || trybOffline) return;
+  if (ostatnia != 0 && millis() - ostatnia < przerwa) return;
+  // nie w trakcie świecenia, alarmu, sieci serwisowej (tylko AP) ani operacji na magistrali – spróbuje w następnym obiegu loop()
+  if (isCascadeActive || isHoldTimerActive || isRadarAlarmActive || trybSerwisowy || sterownikZajety()) return;
+  if (WiFi.status() != WL_CONNECTED) { ostatnia = millis(); ustawOpisChmury("brak Wi-Fi, czekam"); return; }
+  ostatnia = millis();
+
+  if (!chmuraCzeka) {
+    static bool czasNtp = false;
+    if (!czasNtp) { configTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov"); czasNtp = true; } // bez czekania: czas w tle
+    time_t teraz = time(nullptr);
+    chmuraCzekaRowerzysci = rowerzysciDoWyslania; rowerzysciDoWyslania = 0;
+    chmuraCzekaCzasPracy = millis() / 1000UL;
+    chmuraCzekaCzas = teraz > 1700000000 ? teraz : 0;   // bez ważnego czasu serwer przyjmie czas odbioru
+    char id[48]; snprintf(id, sizeof(id), "s4dali-%06x-%08x-%lu", ESP.getChipId(), bootId, (unsigned long)++chmuraNr);
+    chmuraCzekaId = id; chmuraCzeka = true;
+  }
+
+  String tresc = "field1=" + String(chmuraCzekaRowerzysci) + "&field2=" + String(chmuraCzekaCzasPracy) + "&message_id=" + chmuraCzekaId;
+  if (chmuraCzekaCzas) tresc += "&measured_at=" + String((unsigned long)chmuraCzekaCzas);
+
+  WiFiClient klient; HTTPClient http;
+  http.setTimeout(CHMURA_LIMIT_MS);
+  if (!http.begin(klient, chmuraUrl)) { chmuraCzeka = false; rowerzysciDoWyslania += chmuraCzekaRowerzysci; ustawOpisChmury("zły adres (tylko http://)"); return; }
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  http.addHeader("X-SCCLOUDAPIKEY", chmuraKlucz);
+  int kod = http.POST(tresc);
+  String odp = kod == 200 ? http.getString() : "";
+  http.end();
+  odp.trim();
+
+  przerwa = kod > 0 ? CHMURA_OKRES_MS : min(przerwa * 2, CHMURA_MAX_PRZERWA_MS);
+  if (kod == 200 && odp == "1") { chmuraCzeka = false; ustawOpisChmury("wysyłam co 30 s"); }
+  else if (kod == 200 && odp == "0") { chmuraCzeka = false; ustawOpisChmury("serwer odrzucił dane (klucz?)"); }
+  else if (kod > 0) ustawOpisChmury("błąd serwera HTTP " + String(kod) + ", ponawiam");
+  else ustawOpisChmury("brak połączenia z serwerem, ponawiam");
 }
 
 bool isNightTime() {
@@ -529,6 +623,8 @@ void setup() {
 
   trybOffline = (EEPROM.read(ADDR_WIFI_MODE) == 1);
   recipientEmail = readEmailFromEEPROM(); NAZWA_LOKALIZACJI = readLocationFromEEPROM();
+  chmuraUrl = czytajTekstEEPROM(ADDR_CHMURA_URL, CHMURA_URL_DL); chmuraKlucz = czytajTekstEEPROM(ADDR_CHMURA_KLUCZ, CHMURA_KLUCZ_DL);
+  if (chmuraUrl.length()) chmuraOpis = "czekam na pierwszą wysyłkę";
 
   u8g2.clearBuffer(); u8g2.setFontPosTop(); u8g2.setFont(u8g2_font_unifont_t_polish); 
   
@@ -578,9 +674,13 @@ void setup() {
       WiFiManagerParameter custom_location("location", "Nazwa Szafy/Lokalizacji", NAZWA_LOKALIZACJI.c_str(), 64);
       WiFiManagerParameter custom_text("<" "hr><" "br><" "b>TRYB PRACY STEROWNIKA:<" "/b><" "br>Wpisz <" "b>0<" "/b> -> Tryb ONLINE (WiFi + Raporty)<" "br>Wpisz <" "b>1<" "/b> -> Tryb OFFLINE (Brak sieci)<" "br><" "br>");
       WiFiManagerParameter custom_mode("w_mode", "0 lub 1", trybOffline ? "1" : "0", 2); 
+      WiFiManagerParameter custom_chmura_text("<" "hr><" "b>eaCloud<" "/b> (puste = bez wysyłki)<" "br>");
+      WiFiManagerParameter custom_chmura_url("c_url", "Adres, np. http://192.168.1.50:8198/update", chmuraUrl.c_str(), CHMURA_URL_DL);
+      WiFiManagerParameter custom_chmura_klucz("c_key", "Klucz urządzenia", chmuraKlucz.c_str(), CHMURA_KLUCZ_DL);
 
       wm.addParameter(&custom_email); wm.addParameter(&custom_location);
       wm.addParameter(&custom_text); wm.addParameter(&custom_mode);
+      wm.addParameter(&custom_chmura_text); wm.addParameter(&custom_chmura_url); wm.addParameter(&custom_chmura_klucz);
 
       bool portalZapisany = false;
       if (otworzPortal) {
@@ -593,6 +693,12 @@ void setup() {
         String newEmail = custom_email.getValue(); if (newEmail != recipientEmail && newEmail.indexOf('@') != -1) { recipientEmail = newEmail; saveEmailToEEPROM(recipientEmail); }
         String newLoc = custom_location.getValue(); if (newLoc != NAZWA_LOKALIZACJI && newLoc.length() > 2) { NAZWA_LOKALIZACJI = newLoc; saveLocationToEEPROM(NAZWA_LOKALIZACJI); }
         
+        String newUrl = custom_chmura_url.getValue(); newUrl.trim();
+        String newKey = custom_chmura_klucz.getValue(); newKey.trim();
+        if (newUrl != chmuraUrl) { chmuraUrl = newUrl; zapiszTekstEEPROM(ADDR_CHMURA_URL, CHMURA_URL_DL, chmuraUrl); }
+        if (newKey != chmuraKlucz) { chmuraKlucz = newKey; zapiszTekstEEPROM(ADDR_CHMURA_KLUCZ, CHMURA_KLUCZ_DL, chmuraKlucz); }
+        chmuraOpis = chmuraUrl.length() ? "czekam na pierwszą wysyłkę" : "wyłączona (brak adresu)";
+
         int wModeVal = String(custom_mode.getValue()).toInt();
         if (wModeVal == 1) { EEPROM.write(ADDR_WIFI_MODE, 1); EEPROM.commit(); trybOffline = true; WiFi.disconnect(true); delay(200); WiFi.mode(WIFI_OFF); connected = false; } 
         else { EEPROM.write(ADDR_WIFI_MODE, 0); EEPROM.commit(); trybOffline = false; }
@@ -673,6 +779,8 @@ void loop() {
   }
 
   bool start1Active = (digitalRead(PIN_START1) == LOW); bool start2Active = (digitalRead(PIN_START2) == LOW); bool startActive = start1Active || start2Active;
+  liczRowerzystow(startActive);   // v1.16: przed testem ze strony serwisowej – test nie jest rowerzystą
+  wyslijDoChmury();
   if (testKaskady) { start1Active = (testKaskady == 1); start2Active = (testKaskady == 2); startActive = true; testKaskady = 0; }
   if (mrugajAdr >= 0) { start1Active = start2Active = startActive = false; } // serwis miga oprawą – bez animacji
 
@@ -1065,7 +1173,8 @@ void runSystemReset() {
   EEPROM.write(ADDR_LAMPS_COUNT, 0); EEPROM.write(ADDR_WAVE_MODE, 0); EEPROM.write(ADDR_WIFI_MODE, 0);
   EEPROM.write(ADDR_MAPA_ZNACZNIK, MAPA_ZNACZNIK); for (int i = 0; i < 8; i++) EEPROM.write(ADDR_MAPA + i, 0); EEPROM.write(ADDR_RZAD_L, 0xFF); EEPROM.write(ADDR_RZAD_P, 0xFF);
   for(int i=0; i<4; i++) { EEPROM.write(ADDR_CYCLE_TIME + i, 10); EEPROM.write(ADDR_TARGET_CYCLES + i, 1); EEPROM.write(ADDR_HOLD_TIME + i, 15); }
-  saveEmailToEEPROM("pawel.krajewski@euroasfalt.pl"); saveLocationToEEPROM("Miasto Ulica"); EEPROM.commit();
+  saveEmailToEEPROM("pawel.krajewski@euroasfalt.pl"); saveLocationToEEPROM("Miasto Ulica");
+  zapiszTekstEEPROM(ADDR_CHMURA_URL, CHMURA_URL_DL, ""); zapiszTekstEEPROM(ADDR_CHMURA_KLUCZ, CHMURA_KLUCZ_DL, ""); EEPROM.commit();
   u8g2.clearBuffer(); const char* okStr = "ZRESETOWANO!"; const char* okStr2 = "RESTART..."; u8g2.drawUTF8((128 - u8g2.getUTF8Width(okStr)) / 2, 15, okStr); u8g2.drawUTF8((128 - u8g2.getUTF8Width(okStr2)) / 2, 35, okStr2); u8g2.sendBuffer(); delay(3000); ESP.restart(); 
 }
 
@@ -1921,7 +2030,7 @@ void apiStan() {
     const String& w = dziennikWpisy[(dziennikPoz - i + DZIENNIK_N) % DZIENNIK_N];
     if (w.length()) j += String(i > 1 ? "," : "") + jsonTekst(w);
   }
-  j += "],\"diag\":{\"dali_us\":" + String(daliMaxSpoznienieUs) + ",\"spoznione\":" + String(daliSpoznioneRamki) + ",\"telefony\":" + String(WiFi.softAPgetStationNum()) + ",\"wifi\":" + jsonTekst(wifiOpis) + ",\"ram\":" + String(ESP.getFreeHeap()) + ",\"czas_s\":" + String(millis() / 1000) + "}}";
+  j += "],\"diag\":{\"dali_us\":" + String(daliMaxSpoznienieUs) + ",\"spoznione\":" + String(daliSpoznioneRamki) + ",\"telefony\":" + String(WiFi.softAPgetStationNum()) + ",\"wifi\":" + jsonTekst(wifiOpis) + ",\"chmura\":" + jsonTekst(chmuraOpis) + ",\"rowerzysci\":" + String(rowerzysciRazem) + ",\"ram\":" + String(ESP.getFreeHeap()) + ",\"czas_s\":" + String(millis() / 1000) + "}}";
   server.send(200, "application/json; charset=utf-8", j);
 }
 
@@ -2148,7 +2257,7 @@ function klik(a){
  '<button class="j" onclick="zamknij()">Zamknij</button>';}
 function zamknij(){$('sheet').style.display='none';}
 function rysuj(){
- $('lok').textContent=S.lokalizacja;$('wer').textContent='S-4 Dali v'+S.wersja+(S.diag.wifi?' · Wi-Fi (przed serwisem): '+S.diag.wifi:'')+' · sieć '+S.siec+' (hasło stałe, na ekranie sterownika) · telefony '+S.diag.telefony+' · DALI '+S.diag.dali_us+' µs, spóźnione ramki '+S.diag.spoznione+' · RAM '+S.diag.ram;
+ $('lok').textContent=S.lokalizacja;$('wer').textContent='S-4 Dali v'+S.wersja+(S.diag.wifi?' · Wi-Fi (przed serwisem): '+S.diag.wifi:'')+' · eaCloud: '+S.diag.chmura+' · rowerzyści od startu: '+S.diag.rowerzysci+' · sieć '+S.siec+' (hasło stałe, na ekranie sterownika) · telefony '+S.diag.telefony+' · DALI '+S.diag.dali_us+' µs, spóźnione ramki '+S.diag.spoznione+' · RAM '+S.diag.ram;
  if(document.activeElement.tagName!='INPUT'){$('nl').value=S.rzedy[0];$('np').value=S.rzedy[1];}
  let m='';
  if(bledy>=2)m+='<div class="k e"><b>Brak odpowiedzi sterownika.</b> Sprawdź w ustawieniach WiFi, czy telefon jest połączony z <b>'+S.siec+'</b> (hasło na ekranie sterownika), i czy ekran sterownika działa (restart?). Android: wyłącz dane komórkowe. Strona wróci sama'+(czekamId?'; wynik zleconej operacji pokaże się po odzyskaniu połączenia':'')+'.</div>';
