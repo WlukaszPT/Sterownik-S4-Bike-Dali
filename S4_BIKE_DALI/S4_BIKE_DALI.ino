@@ -59,8 +59,8 @@
 //       „S4”/„opraw S4”. Stan Wi-Fi z przyczyną (złe hasło, nie widzę sieci, odmowa) na ekranie, w dzienniku i na stronie.
 //       Kreator: szukanie miejsca o podwójnym numerze krok po kroku – miejsce miga, dopóki serwisant nie odpowie
 //       „Tak, mruga” / „Nie – następne” (wcześniej mruganie przechodziło samo co 1,5 s i nie dało się zdążyć).
-// v1.16: wysyłka danych do eaCloud co 30 s (POST /update, kontrakt v2): field1 = liczba rowerzystów od poprzedniej
-//       wysyłki (wejścia czujników START1/START2), field2 = czas pracy od uruchomienia [s], measured_at (gdy jest czas
+// v1.16: wysyłka danych do eaCloud co 30 s (POST /update, kontrakt v2): field1 = licznik rowerzystów narastający od
+//       uruchomienia (wejścia czujników START1/START2; eaCloud liczy przyrosty, spadek = restart), field2 = czas pracy od uruchomienia [s], measured_at (gdy jest czas
 //       z NTP) i message_id (powtórzenie po zerwanym połączeniu nie tworzy duplikatu). Adres serwera i klucz urządzenia
 //       w secrets.h (EACLOUD_URL, EACLOUD_KEY) albo w portalu Wi-Fi (S2 przy starcie); pusty adres = wysyłka wyłączona. Wysyłka czeka, gdy oczka świecą;
 //       odpowiedź serwera odbierana w tle (sterownik nie czeka na nią i czyta czujniki).
@@ -485,9 +485,9 @@ bool wyslijRaportEmail() {
 // ==========================================
 // v1.16: WYSYŁKA DANYCH DO eaCloud (kontrakt v2: docs/INGEST-KONTRAKT.md w repozytorium eaCloud)
 // ==========================================
-// Co CHMURA_OKRES_MS jedna wiadomość: field1 = rowerzyści od poprzedniej przyjętej wiadomości, field2 = czas pracy [s].
-// Wiadomość bez odpowiedzi serwera jest ponawiana bez zmian (ten sam message_id, serwer nie zapisze jej dwa razy);
-// rowerzyści policzeni w tym czasie idą w następnej. Odpowiedź „0” (zły klucz albo dane) – bez ponawiania, wpis w dzienniku.
+// Co CHMURA_OKRES_MS jedna wiadomość: field1 = rowerzyści od uruchomienia (licznik narastający – eaCloud liczy przyrosty
+// między odczytami, a spadek wartości traktuje jak zerowanie), field2 = czas pracy [s].
+// Wiadomość bez odpowiedzi serwera jest ponawiana bez zmian (ten sam message_id, serwer nie zapisze jej dwa razy). Odpowiedź „0” (zły klucz albo dane) – bez ponawiania, wpis w dzienniku.
 const unsigned long CHMURA_OKRES_MS = 30000UL;
 const uint16_t CHMURA_LIMIT_MS = 1000;        // limit czasu nawiązania połączenia (sterownik w tym czasie nie czyta czujników)
 const unsigned long CHMURA_ODPOWIEDZ_MS = 15000UL; // odpowiedź serwera odbierana w tle, najwyżej tyle
@@ -495,8 +495,7 @@ const unsigned long CHMURA_MAX_PRZERWA_MS = 5UL * 60UL * 1000UL; // serwer nie o
 const unsigned long CZUJNIK_PRZERWA_MS = 500; // krótsza przerwa w sygnale czujnika = ten sam rowerzysta
 
 String chmuraUrl = "", chmuraKlucz = "";
-uint32_t rowerzysciDoWyslania = 0;   // policzeni, jeszcze nie w żadnej wiadomości
-uint32_t rowerzysciRazem = 0;        // od uruchomienia (strona serwisowa)
+uint32_t rowerzysciRazem = 0;        // od uruchomienia (field1, strona serwisowa)
 uint32_t chmuraNr = 0;               // numer wiadomości w tym uruchomieniu
 bool chmuraCzeka = false;            // wiadomość wysłana bez odpowiedzi – ponowić
 uint32_t chmuraCzekaRowerzysci = 0; unsigned long chmuraCzekaCzasPracy = 0; time_t chmuraCzekaCzas = 0; String chmuraCzekaId = "";
@@ -505,7 +504,7 @@ bool sterownikZajety();
 // Wejście czujnika (START1 lub START2): nowy rowerzysta po co najmniej CZUJNIK_PRZERWA_MS bez sygnału.
 void liczRowerzystow(bool czujnik) {
   static bool byl = false; static unsigned long koniecSygnalu = 0;
-  if (czujnik && !byl && millis() - koniecSygnalu >= CZUJNIK_PRZERWA_MS) { rowerzysciDoWyslania++; rowerzysciRazem++; }
+  if (czujnik && !byl && millis() - koniecSygnalu >= CZUJNIK_PRZERWA_MS) { rowerzysciRazem++; }
   if (!czujnik && byl) koniecSygnalu = millis();
   byl = czujnik;
 }
@@ -565,7 +564,7 @@ void wyslijDoChmury() {
     static bool czasNtp = false;
     if (!czasNtp) { configTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov"); czasNtp = true; } // bez czekania: czas w tle
     time_t teraz = time(nullptr);
-    chmuraCzekaRowerzysci = rowerzysciDoWyslania; rowerzysciDoWyslania = 0;
+    chmuraCzekaRowerzysci = rowerzysciRazem;
     chmuraCzekaCzasPracy = millis() / 1000UL;
     chmuraCzekaCzas = teraz > 1700000000 ? teraz : 0;   // bez ważnego czasu serwer przyjmie czas odbioru
     char id[48]; snprintf(id, sizeof(id), "s4dali-%06x-%08x-%lu", ESP.getChipId(), bootId, (unsigned long)++chmuraNr);

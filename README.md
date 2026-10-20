@@ -17,7 +17,7 @@ Co 30 s sterownik wysyła `POST /update` (kontrakt v2 eaCloud):
 
 | Pole | Znaczenie |
 |---|---|
-| `field1` | liczba rowerzystów od poprzedniej wysyłki (wejścia czujników START1/START2, przerwa w sygnale ≥ 0,5 s = nowy rowerzysta) |
+| `field1` | licznik rowerzystów **narastający od uruchomienia** (wejścia czujników START1/START2, przerwa w sygnale ≥ 0,5 s = nowy rowerzysta); eaCloud liczy przyrosty między odczytami, spadek = restart sterownika |
 | `field2` | czas pracy od uruchomienia [s] |
 | `measured_at` | czas wysyłki (unix, UTC) – gdy sterownik ma czas z NTP |
 | `message_id` | `s4dali-<chip>-<uruchomienie>-<nr>`; ponowienie po zerwanym połączeniu nie tworzy duplikatu |
@@ -28,7 +28,7 @@ Ustawienia: `EACLOUD_URL` i `EACLOUD_KEY` w `secrets.h` (wzór w `secrets.exampl
 Gdy są puste: przytrzymaj **S2 przy starcie**, połącz się z siecią `S-4_Dali_WiFi` i wpisz w sekcji *eaCloud* adres
 (np. `http://192.168.1.50:8198/update`) i klucz urządzenia z eaCloud. Pusty adres = wysyłka wyłączona.
 
-- Wysyłka czeka, gdy oczka świecą, trwa alarm, sieć serwisowa albo operacja na magistrali DALI; rowerzyści się nie gubią.
+- Wysyłka czeka, gdy oczka świecą, trwa alarm, sieć serwisowa albo operacja na magistrali DALI; odpowiedź serwera odbierana w tle.
 - Brak odpowiedzi serwera: ta sama wiadomość jest ponawiana, przerwa rośnie 30 s → 60 s → … → 5 min.
 - Odpowiedź `0` (zły klucz lub dane): bez ponawiania, wpis w dzienniku.
 - Stan wysyłki: dziennik i stopka strony serwisowej, raport e-mail.
