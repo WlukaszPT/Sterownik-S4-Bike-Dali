@@ -62,7 +62,8 @@
 // v1.16: wysyłka danych do eaCloud co 30 s (POST /update, kontrakt v2): field1 = liczba rowerzystów od poprzedniej
 //       wysyłki (wejścia czujników START1/START2), field2 = czas pracy od uruchomienia [s], measured_at (gdy jest czas
 //       z NTP) i message_id (powtórzenie po zerwanym połączeniu nie tworzy duplikatu). Adres serwera i klucz urządzenia
-//       w secrets.h (EACLOUD_URL, EACLOUD_KEY) albo w portalu Wi-Fi (S2 przy starcie); pusty adres = wysyłka wyłączona. Wysyłka czeka, gdy oczka świecą.
+//       w secrets.h (EACLOUD_URL, EACLOUD_KEY) albo w portalu Wi-Fi (S2 przy starcie); pusty adres = wysyłka wyłączona. Wysyłka czeka, gdy oczka świecą;
+//       odpowiedź serwera odbierana w tle (sterownik nie czeka na nią i czyta czujniki).
 // =========================================================================
 
 #define FW_VERSION "1.16"
@@ -74,7 +75,6 @@
 #include <ESP8266WiFi.h>
 #include <WiFiManager.h> 
 #include <ESP8266WebServer.h> 
-#include <ESP8266HTTPClient.h>
 #include <DNSServer.h>
 #include <RTClib.h>
 #include <Dusk2Dawn.h>
@@ -489,7 +489,8 @@ bool wyslijRaportEmail() {
 // Wiadomość bez odpowiedzi serwera jest ponawiana bez zmian (ten sam message_id, serwer nie zapisze jej dwa razy);
 // rowerzyści policzeni w tym czasie idą w następnej. Odpowiedź „0” (zły klucz albo dane) – bez ponawiania, wpis w dzienniku.
 const unsigned long CHMURA_OKRES_MS = 30000UL;
-const uint16_t CHMURA_LIMIT_MS = 1500;        // limit czasu połączenia i odpowiedzi (sterownik w tym czasie nie czyta czujników)
+const uint16_t CHMURA_LIMIT_MS = 1000;        // limit czasu nawiązania połączenia (sterownik w tym czasie nie czyta czujników)
+const unsigned long CHMURA_ODPOWIEDZ_MS = 15000UL; // odpowiedź serwera odbierana w tle, najwyżej tyle
 const unsigned long CHMURA_MAX_PRZERWA_MS = 5UL * 60UL * 1000UL; // serwer nie odpowiada: przerwa rośnie 30 s, 60 s … do 5 min
 const unsigned long CZUJNIK_PRZERWA_MS = 500; // krótsza przerwa w sygnale czujnika = ten sam rowerzysta
 
@@ -513,14 +514,52 @@ void ustawOpisChmury(const String& t) {
   if (t != chmuraOpis) { chmuraOpis = t; dziennik("eaCloud: " + t); }
 }
 
+// v1.16: adres http://host[:port]/ścieżka (bez HTTPS)
+bool rozbierzUrl(const String& u, String& host, uint16_t& port, String& sciezka) {
+  if (!u.startsWith("http://")) return false;
+  String r = u.substring(7); int ukosnik = r.indexOf('/');
+  String hp = ukosnik < 0 ? r : r.substring(0, ukosnik); sciezka = ukosnik < 0 ? "/" : r.substring(ukosnik);
+  int dwukropek = hp.indexOf(':');
+  host = dwukropek < 0 ? hp : hp.substring(0, dwukropek); port = dwukropek < 0 ? 80 : hp.substring(dwukropek + 1).toInt();
+  return host.length() > 0 && port > 0;
+}
+
+// Wysyłka bez czekania na odpowiedź: żądanie idzie od razu po połączeniu, odpowiedź serwera jest odbierana w kolejnych
+// obiegach loop() (obsluzOdpowiedzChmury). Lokalny serwer odpowiadał po ~2,7 s – czekanie blokowało czujniki.
+WiFiClient chmuraKlient;
+bool chmuraWToku = false; unsigned long chmuraWyslano = 0; String chmuraOdp = "";
+unsigned long chmuraOstatnia = 0, chmuraPrzerwa = CHMURA_OKRES_MS;
+
+void zakonczWysylkeChmury(int kod, const String& tresc) {
+  chmuraKlient.stop(); chmuraWToku = false; chmuraOdp = "";
+  chmuraPrzerwa = kod > 0 ? CHMURA_OKRES_MS : min(chmuraPrzerwa * 2, CHMURA_MAX_PRZERWA_MS);
+  if (kod == 200 && tresc == "1") { chmuraCzeka = false; ustawOpisChmury("wysyłam co 30 s"); }
+  else if (kod == 200 && tresc == "0") { chmuraCzeka = false; ustawOpisChmury("serwer odrzucił dane (klucz?)"); }
+  else if (kod > 0) ustawOpisChmury("błąd serwera HTTP " + String(kod) + ", ponawiam");
+  else ustawOpisChmury("brak odpowiedzi serwera, ponawiam");
+}
+
+void obsluzOdpowiedzChmury() {
+  if (!chmuraWToku) return;
+  while (chmuraKlient.available() && chmuraOdp.length() < 1024) chmuraOdp += (char)chmuraKlient.read();
+  bool koniec = !chmuraKlient.connected() && !chmuraKlient.available();
+  if (!koniec && millis() - chmuraWyslano < CHMURA_ODPOWIEDZ_MS) return;
+  // HTTP/1.0: serwer zamyka połączenie po odpowiedzi; „HTTP/1.1 200 OK\r\n…\r\n\r\n1”
+  int kod = chmuraOdp.startsWith("HTTP/") ? chmuraOdp.substring(chmuraOdp.indexOf(' ') + 1).toInt() : 0;
+  int poczatek = chmuraOdp.indexOf("\r\n\r\n");
+  String tresc = poczatek < 0 ? "" : chmuraOdp.substring(poczatek + 4); tresc.trim();
+  zakonczWysylkeChmury(koniec ? kod : 0, tresc);
+}
+
 void wyslijDoChmury() {
-  static unsigned long ostatnia = 0, przerwa = CHMURA_OKRES_MS;
-  if (chmuraUrl.length() == 0 || trybOffline) return;
-  if (ostatnia != 0 && millis() - ostatnia < przerwa) return;
+  if (chmuraUrl.length() == 0 || trybOffline || chmuraWToku) return;
+  if (chmuraOstatnia != 0 && millis() - chmuraOstatnia < chmuraPrzerwa) return;
   // nie w trakcie świecenia, alarmu, sieci serwisowej (tylko AP) ani operacji na magistrali – spróbuje w następnym obiegu loop()
   if (isCascadeActive || isHoldTimerActive || isRadarAlarmActive || trybSerwisowy || sterownikZajety()) return;
-  if (WiFi.status() != WL_CONNECTED) { ostatnia = millis(); ustawOpisChmury("brak Wi-Fi, czekam"); return; }
-  ostatnia = millis();
+  chmuraOstatnia = millis();
+  if (WiFi.status() != WL_CONNECTED) { ustawOpisChmury("brak Wi-Fi, czekam"); return; }
+  String host, sciezka; uint16_t port;
+  if (!rozbierzUrl(chmuraUrl, host, port, sciezka)) { ustawOpisChmury("zły adres (tylko http://)"); return; }
 
   if (!chmuraCzeka) {
     static bool czasNtp = false;
@@ -536,21 +575,14 @@ void wyslijDoChmury() {
   String tresc = "field1=" + String(chmuraCzekaRowerzysci) + "&field2=" + String(chmuraCzekaCzasPracy) + "&message_id=" + chmuraCzekaId;
   if (chmuraCzekaCzas) tresc += "&measured_at=" + String((unsigned long)chmuraCzekaCzas);
 
-  WiFiClient klient; HTTPClient http;
-  http.setTimeout(CHMURA_LIMIT_MS);
-  if (!http.begin(klient, chmuraUrl)) { chmuraCzeka = false; rowerzysciDoWyslania += chmuraCzekaRowerzysci; ustawOpisChmury("zły adres (tylko http://)"); return; }
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  http.addHeader("X-SCCLOUDAPIKEY", chmuraKlucz);
-  int kod = http.POST(tresc);
-  String odp = kod == 200 ? http.getString() : "";
-  http.end();
-  odp.trim();
-
-  przerwa = kod > 0 ? CHMURA_OKRES_MS : min(przerwa * 2, CHMURA_MAX_PRZERWA_MS);
-  if (kod == 200 && odp == "1") { chmuraCzeka = false; ustawOpisChmury("wysyłam co 30 s"); }
-  else if (kod == 200 && odp == "0") { chmuraCzeka = false; ustawOpisChmury("serwer odrzucił dane (klucz?)"); }
-  else if (kod > 0) ustawOpisChmury("błąd serwera HTTP " + String(kod) + ", ponawiam");
-  else ustawOpisChmury("brak połączenia z serwerem, ponawiam");
+  chmuraKlient.setTimeout(CHMURA_LIMIT_MS);   // limit samego połączenia (serwer w sieci lokalnej: kilka ms)
+  if (!chmuraKlient.connect(host.c_str(), port)) {
+    chmuraKlient.stop(); chmuraPrzerwa = min(chmuraPrzerwa * 2, CHMURA_MAX_PRZERWA_MS); ustawOpisChmury("brak połączenia z serwerem, ponawiam"); return;
+  }
+  chmuraKlient.print(String("POST ") + sciezka + " HTTP/1.0\r\nHost: " + host + ":" + String(port) +
+                     "\r\nX-SCCLOUDAPIKEY: " + chmuraKlucz + "\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " +
+                     String(tresc.length()) + "\r\nConnection: close\r\n\r\n" + tresc);
+  chmuraWToku = true; chmuraWyslano = millis(); chmuraOdp = "";
 }
 
 bool isNightTime() {
@@ -791,6 +823,7 @@ void loop() {
 
   bool start1Active = (digitalRead(PIN_START1) == LOW); bool start2Active = (digitalRead(PIN_START2) == LOW); bool startActive = start1Active || start2Active;
   liczRowerzystow(startActive);   // v1.16: przed testem ze strony serwisowej – test nie jest rowerzystą
+  obsluzOdpowiedzChmury();
   wyslijDoChmury();
   if (testKaskady) { start1Active = (testKaskady == 1); start2Active = (testKaskady == 2); startActive = true; testKaskady = 0; }
   if (mrugajAdr >= 0) { start1Active = start2Active = startActive = false; } // serwis miga oprawą – bez animacji
