@@ -3,6 +3,10 @@
 
 - `S4_BIKE_DALI/S4_BIKE_DALI.ino` – firmware sterownika S-4 Dali (ESP8266). Wersja w `FW_VERSION` i w historii zmian na początku pliku.
 - `S4_BIKE_DALI/secrets.example.h` – wzór pliku z danymi konta e-mail.
+- `S4_BIKE_DALI_v1.17/S4_BIKE_DALI_v1.17.ino` – firmware v1.17 **bez połączenia z portalem eaCloud**. Testowany na
+  chemicznej z oczkami typu dynamic oraz S4Dali. Animacja „Przejście S4” (białe ciągle, pomarańczowe pulsują,
+  menu PULS POMARAŃCZ), poprawki skanu i testu smugi, przyczyny awarii w dzienniku serwisowym. Wzór `secrets.h`
+  w tym samym folderze.
 
 ## Kompilacja
 
